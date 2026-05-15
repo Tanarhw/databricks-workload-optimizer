@@ -1,6 +1,8 @@
+import json
+
 from fastmcp import FastMCP
 
-from server.utils import get_client
+from server.utils import get_client, get_warehouse_id, run_sql
 
 
 def register_tools(mcp: FastMCP) -> None:
@@ -220,11 +222,122 @@ def register_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def scan_table_health(table_name: str) -> str:
         """Check a Delta table for small files, missing Z-order, and stale statistics."""
-        # TODO: implement
-        # Plan: DESCRIBE DETAIL <table>, DESCRIBE HISTORY <table>
-        # Check: avg file size, last OPTIMIZE/ZORDER run, last ANALYZE run,
-        #        num files vs ideal target
-        return f"scan_table_health not yet implemented (table_name={table_name})"
+        client = get_client()
+
+        try:
+            warehouse_id = get_warehouse_id(client)
+        except RuntimeError as e:
+            return f"Cannot run table scan — no SQL warehouse available: {e}"
+
+        try:
+            detail_rows = run_sql(client, warehouse_id, f"DESCRIBE DETAIL {table_name}")
+        except RuntimeError as e:
+            return f"Could not describe table '{table_name}': {e}"
+
+        if not detail_rows:
+            return f"No detail returned for table '{table_name}' — does it exist?"
+
+        d = detail_rows[0]
+        num_files = int(d.get("numFiles") or 0)
+        size_bytes = int(d.get("sizeInBytes") or 0)
+        table_format = d.get("format", "unknown")
+        partition_cols = d.get("partitionColumns") or "[]"
+
+        lines = [f"## Table: {table_name}\n"]
+        lines.append(f"Format: {table_format} | Partitioned by: {partition_cols}")
+
+        warnings: list[str] = []
+        good: list[str] = []
+
+        # --- File size health ---
+        if num_files > 0 and size_bytes > 0:
+            avg_mb = (size_bytes / num_files) / (1024 ** 2)
+            total_gb = size_bytes / (1024 ** 3)
+            lines.append(f"Files: {num_files} | Avg size: {avg_mb:.1f} MB | Total: {total_gb:.2f} GB\n")
+
+            if avg_mb < 32:
+                warnings.append(
+                    f"**Small file problem: avg file is only {avg_mb:.1f} MB.**\n"
+                    "  Spark opens one task per file — thousands of tiny files kill parallelism.\n"
+                    "  Fix: `OPTIMIZE {table_name}` — this compacts files to ~128 MB each."
+                )
+            elif avg_mb < 64:
+                warnings.append(
+                    f"**Files are on the small side ({avg_mb:.1f} MB avg, target ~128 MB).**\n"
+                    "  Fix: Run `OPTIMIZE {table_name}` to compact."
+                )
+            else:
+                good.append(f"File sizes look healthy ({avg_mb:.1f} MB avg).")
+        else:
+            lines.append("Table appears to be empty.\n")
+
+        # --- History analysis ---
+        try:
+            history = run_sql(client, warehouse_id, f"DESCRIBE HISTORY {table_name} LIMIT 30")
+        except RuntimeError:
+            history = []
+
+        last_optimize_ts = None
+        last_zorder_cols: list[str] = []
+        last_analyze_ts = None
+
+        for row in history:
+            op = (row.get("operation") or "").upper()
+            ts = row.get("timestamp")
+
+            if op == "OPTIMIZE" and last_optimize_ts is None:
+                last_optimize_ts = ts
+                params_raw = row.get("operationParameters") or "{}"
+                try:
+                    params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+                    zorder_raw = params.get("zOrderBy", "[]")
+                    last_zorder_cols = json.loads(zorder_raw) if isinstance(zorder_raw, str) else zorder_raw
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            if op in ("ANALYZE", "ANALYZE TABLE") and last_analyze_ts is None:
+                last_analyze_ts = ts
+
+        if last_optimize_ts:
+            good.append(f"Last OPTIMIZE ran at {last_optimize_ts}.")
+        else:
+            warnings.append(
+                "**No OPTIMIZE has ever been run on this table.**\n"
+                f"  Fix: `OPTIMIZE {table_name}` — compacts small files and improves read performance."
+            )
+
+        if last_zorder_cols:
+            good.append(f"Z-ORDER active on: {', '.join(last_zorder_cols)}.")
+        else:
+            warnings.append(
+                "**No Z-ORDER configured.**\n"
+                "  Z-ORDER co-locates related data so queries skip irrelevant files.\n"
+                f"  Fix: `OPTIMIZE {table_name} ZORDER BY (your_filter_column)` — use the column you filter on most."
+            )
+
+        if last_analyze_ts:
+            good.append(f"Table statistics last updated at {last_analyze_ts}.")
+        else:
+            warnings.append(
+                "**No ANALYZE TABLE has been run — statistics are stale or missing.**\n"
+                "  Without statistics, the query planner makes poor join and filter decisions.\n"
+                f"  Fix: `ANALYZE TABLE {table_name} COMPUTE STATISTICS FOR ALL COLUMNS`"
+            )
+
+        # --- Assemble ---
+        if warnings:
+            lines.append("### Issues found\n")
+            for w in warnings:
+                lines.append(f"- {w}\n")
+        else:
+            lines.append("Table health looks good.\n")
+
+        if good:
+            lines.append("### Looks good\n")
+            for g in good:
+                lines.append(f"- {g}")
+
+        return "\n".join(lines)
 
     @mcp.tool()
     def explain_query_plan(query: str) -> str:
