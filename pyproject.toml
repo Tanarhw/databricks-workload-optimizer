@@ -1,0 +1,19 @@
+[project]
+name = "databricks-workload-optimizer"
+version = "0.1.0"
+description = "MCP server for Databricks workload optimization"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "databricks-sdk>=0.32",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+workload-optimizer = "server.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
