@@ -1,0 +1,16 @@
+# Your important pipelines — edit this file to add/remove resources.
+# Run /diagnose-pipelines in Claude Code to check all of them at once.
+
+jobs:
+  - id: "12345"
+    name: "Daily ingestion"
+  - id: "67890"
+    name: "Weekly aggregation"
+
+clusters:
+  - id: "abc-123-def"
+    name: "Production cluster"
+
+tables:
+  - name: "main.analytics.events"
+  - name: "main.analytics.users"
