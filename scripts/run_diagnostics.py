@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Weekly pipeline diagnostic runner. Reads config/pipelines.yaml and checks all resources."""
 
+import base64
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,10 @@ except ImportError:
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import Disposition, StatementState
+from databricks.sdk.service.workspace import ExportFormat
+
+REPORTS_DIR = Path(__file__).parent.parent / "reports"
+LAST_RUN_PATH = REPORTS_DIR / "last_run.json"
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +196,127 @@ def check_table(client: WorkspaceClient, warehouse_id: str | None, table_name: s
     return {"resource": table_name, "type": "table", "id": table_name, "findings": findings}
 
 
+NOTEBOOK_PATTERNS = [
+    {"name": ".collect() without limit", "regex": r"\.collect\(\)", "severity": "HIGH",
+     "detail": "Pulls entire DataFrame to driver — OOM on large tables.",
+     "fix": "Aggregate first, or use .limit(n).collect() for samples."},
+    {"name": ".toPandas() on large DataFrame", "regex": r"\.toPandas\(\)", "severity": "HIGH",
+     "detail": "Same as .collect() — moves all data to driver memory.",
+     "fix": "Sample first: .limit(10000).toPandas()"},
+    {"name": "repartition or coalesce to 1", "regex": r"\.(repartition|coalesce)\(\s*1\s*\)", "severity": "MEDIUM",
+     "detail": "Forces a full shuffle into a single task — serializes the job.",
+     "fix": "Only use before writing a single-file output."},
+    {"name": "ORDER BY without LIMIT", "regex": r"(?i)order\s+by\b(?!.*\blimit\b)", "severity": "MEDIUM",
+     "detail": "Full shuffle across all rows.",
+     "fix": "Add LIMIT, or sort after aggregating to a smaller result set."},
+    {"name": "SELECT *", "regex": r"(?i)select\s+\*\s+from", "severity": "LOW",
+     "detail": "Reads all columns — hurts Parquet/Delta performance.",
+     "fix": "Select only the columns you need."},
+]
+
+
+def check_notebook(client: WorkspaceClient, path: str, name: str) -> dict:
+    findings = []
+    try:
+        result = client.workspace.export(path, format=ExportFormat.SOURCE)
+        source = base64.b64decode(result.content).decode("utf-8")
+    except Exception as e:
+        return {"resource": name, "type": "notebook", "id": path, "error": str(e), "findings": []}
+
+    lines = source.splitlines()
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith("//"):
+            continue
+        for p in NOTEBOOK_PATTERNS:
+            if re.search(p["regex"], stripped):
+                findings.append({
+                    "severity": p["severity"],
+                    "message": f"Line {i}: {p['name']} — {p['detail']} Fix: {p['fix']}",
+                })
+
+    reads = re.findall(
+        r'spark\.read[^)]*\.(?:table|load|parquet|csv|json|orc)\(["\']([^"\']+)["\']', source
+    )
+    seen: dict[str, int] = {}
+    for table in reads:
+        seen[table] = seen.get(table, 0) + 1
+    for table, count in seen.items():
+        if count > 1:
+            findings.append({
+                "severity": "MEDIUM",
+                "message": f"'{table}' read {count}x without caching. Fix: read once and call .cache()",
+            })
+
+    return {"resource": name, "type": "notebook", "id": path, "findings": findings}
+
+
+# ---------------------------------------------------------------------------
+# Health score
+# ---------------------------------------------------------------------------
+
+SCORE_DEDUCTIONS = {"HIGH": 20, "MEDIUM": 10, "LOW": 5}
+GRADE_THRESHOLDS = [(90, "A"), (75, "B"), (60, "C"), (40, "D")]
+
+
+def calculate_score(results: list[dict]) -> tuple[int, str]:
+    score = 100
+    for r in results:
+        for f in r.get("findings", []):
+            score -= SCORE_DEDUCTIONS.get(f["severity"], 0)
+    score = max(0, score)
+    grade = next((g for threshold, g in GRADE_THRESHOLDS if score >= threshold), "F")
+    return score, grade
+
+
+# ---------------------------------------------------------------------------
+# Trend — persist last run locally
+# ---------------------------------------------------------------------------
+
+def load_previous_run() -> dict | None:
+    if not LAST_RUN_PATH.exists():
+        return None
+    try:
+        with open(LAST_RUN_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_current_run(results: list[dict], score: int, grade: str) -> None:
+    REPORTS_DIR.mkdir(exist_ok=True)
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "score": score,
+        "grade": grade,
+        "results": [
+            {"resource": r["resource"], "type": r["type"], "id": r["id"],
+             "finding_keys": sorted(f["message"][:60] for f in r.get("findings", []))}
+            for r in results
+        ],
+    }
+    with open(LAST_RUN_PATH, "w") as f:
+        json.dump(snapshot, f, indent=2)
+
+
+def build_trend(results: list[dict], previous: dict | None) -> dict:
+    """Returns per-resource sets of new and resolved issue keys."""
+    if not previous:
+        return {}
+
+    prev_by_id = {r["id"]: set(r.get("finding_keys", [])) for r in previous.get("results", [])}
+    trend = {}
+    for r in results:
+        rid = r["id"]
+        current_keys = {f["message"][:60] for f in r.get("findings", [])}
+        prev_keys = prev_by_id.get(rid, set())
+        new = current_keys - prev_keys
+        resolved = prev_keys - current_keys
+        if new or resolved:
+            trend[rid] = {"new": new, "resolved": resolved}
+    return trend
+
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -198,34 +325,55 @@ SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 SEVERITY_LABEL = {"HIGH": "🔴 HIGH", "MEDIUM": "🟡 MEDIUM", "LOW": "🔵 LOW"}
 
 
-def print_report(results: list[dict]) -> int:
+def print_report(results: list[dict], score: int, grade: str, previous: dict | None, trend: dict) -> int:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n{'='*60}")
+
+    # Score line with trend
+    prev_score = previous.get("score") if previous else None
+    prev_grade = previous.get("grade") if previous else None
+    if prev_score is not None:
+        delta = score - prev_score
+        arrow = f"▲ +{delta}" if delta > 0 else (f"▼ {delta}" if delta < 0 else "→ no change")
+        score_line = f"  Health: {grade} ({score}/100)  {arrow} vs last run ({prev_grade}, {prev_score}/100)"
+    else:
+        score_line = f"  Health: {grade} ({score}/100)  (first run — no trend data yet)"
+
+    print(f"\n{'='*62}")
     print(f"  Databricks Pipeline Diagnostics — {timestamp}")
-    print(f"{'='*60}\n")
+    print(score_line)
+    print(f"{'='*62}\n")
 
     high_count = 0
     for r in results:
-        label = f"[{r['type'].upper()}] {r['resource']} ({r['id']})"
+        label = f"[{r['type'].upper()}] {r['resource']}"
+        resource_trend = trend.get(r["id"], {})
+
         if "error" in r:
             print(f"  ⚠️  {label}")
             print(f"      Error: {r['error']}\n")
             continue
 
-        findings = sorted(r["findings"], key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
+        findings = sorted(r.get("findings", []), key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
         high_count += sum(1 for f in findings if f["severity"] == "HIGH")
 
         if not findings:
-            print(f"  ✅ {label} — clean\n")
+            print(f"  ✅ {label} — clean")
+            if resource_trend.get("resolved"):
+                print(f"      ✨ {len(resource_trend['resolved'])} issue(s) resolved since last run")
+            print()
         else:
             print(f"  {label}")
             for f in findings:
-                print(f"      {SEVERITY_LABEL[f['severity']]}: {f['message']}")
+                key = f["message"][:60]
+                tag = " 🆕" if key in resource_trend.get("new", set()) else ""
+                print(f"      {SEVERITY_LABEL[f['severity']]}{tag}: {f['message']}")
+            if resource_trend.get("resolved"):
+                print(f"      ✨ {len(resource_trend['resolved'])} issue(s) resolved since last run")
             print()
 
     total_issues = sum(len(r.get("findings", [])) for r in results)
-    print(f"{'='*60}")
-    print(f"  {len(results)} resource(s) checked | {total_issues} issue(s) found | {high_count} HIGH\n")
+    print(f"{'='*62}")
+    print(f"  {len(results)} resource(s) checked | {total_issues} issue(s) | {high_count} HIGH\n")
 
     return high_count
 
@@ -246,6 +394,7 @@ def main() -> None:
 
     client = get_client()
     warehouse_id = get_warehouse_id(client)
+    previous = load_previous_run()
     results = []
 
     for job in config.get("jobs", []):
@@ -260,7 +409,15 @@ def main() -> None:
         print(f"Checking table: {table['name']}...")
         results.append(check_table(client, warehouse_id, table["name"]))
 
-    high_count = print_report(results)
+    for notebook in config.get("notebooks", []):
+        print(f"Scanning notebook: {notebook['name']}...")
+        results.append(check_notebook(client, notebook["path"], notebook["name"]))
+
+    score, grade = calculate_score(results)
+    trend = build_trend(results, previous)
+    high_count = print_report(results, score, grade, previous, trend)
+    save_current_run(results, score, grade)
+
     sys.exit(1 if high_count > 0 else 0)
 
 

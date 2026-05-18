@@ -14,3 +14,7 @@ clusters:
 tables:
   - name: "main.analytics.events"
   - name: "main.analytics.users"
+
+notebooks:
+  - path: "/Users/you@company.com/your_notebook"
+    name: "Daily ingestion notebook"
